@@ -30,6 +30,16 @@ with tempfile.TemporaryDirectory(prefix="rangeglass-smoke-") as directory:
         report = json.loads(result.stdout)
         if result.returncode != code or report["verdict"] != verdict:
             raise SystemExit(f"Smoke failed: {mode}, exit={result.returncode}, report={report}")
-        if report["bytes_read"] > 7175 or report["schema_version"] != 1:
+        if report["bytes_read"] > 8200 or report["schema_version"] != 1:
             raise SystemExit("Unexpected byte budget or report schema.")
         print(f"{mode}: {verdict}, exit {code}, {report['bytes_read']} bytes")
+    markdown = subprocess.run(
+        [*command, "--demo", "good", "--markdown"],
+        cwd=directory,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if markdown.returncode != 0 or "### Rangeglass diagnostic" not in markdown.stdout:
+        raise SystemExit("Packaged Markdown export failed.")
+    print("markdown: packaged export passed")

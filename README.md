@@ -11,31 +11,43 @@
 
 <p align="center"><a href="README.zh-CN.md">简体中文</a> · <a href="#try-it">Try it</a> · <a href="#what-it-checks">Checks</a> · <a href="docs/report-format.md">JSON reference</a></p>
 
-# Rangeglass
+# Rangeglass — HTTP Range & download resume checker
 
 **See whether a download URL really supports HTTP ranges and conditional resume.**
 
 A small command-line tool for debugging interrupted downloads, broken CDN byte ranges, and files that corrupt when downloaded in chunks. It makes real range requests, checks the responses against each other, and explains what went wrong.
 
 - **Check bytes, not promises.** Tests offsets, overlapping content, lengths, ETags, and `If-Range` behavior.
-- **Small reads.** At most **7,175 response-body bytes** with the default settings, even when a server ignores `Range`.
-- **Easy to share.** Plain-text findings, suggested next steps, and versioned JSON reports.
+- **Small reads.** At most **8,200 response-body bytes** with the default settings, including the optional tail fallback, even when a server ignores `Range`.
+- **Easy to share.** Plain-text findings, Markdown reports for issues, and versioned JSON output.
 - **No runtime dependencies.** Python standard library; Windows, macOS, and Linux. No account or service.
 
 Use it before fetching a large model, when a release download keeps restarting, or while configuring an object-store proxy. It diagnoses one URL; your existing downloader still does the downloading.
+
+## When is it useful?
+
+| Your problem | What the report helps you check |
+| --- | --- |
+| An interrupted download starts over instead of resuming. | Whether actual HTTP byte-range requests work. |
+| curl reports error 33, or says the server does not support byte ranges. | Whether the endpoint returns `206 Partial Content` or ignores Range with `200 OK`. |
+| A file corrupts only with parallel/chunked downloading. | Wrong `Content-Range`, inconsistent bytes, changed ETags, or incomplete responses. |
+| A CDN or reverse-proxy configuration just changed. | Whether offsets and `If-Range` still behave consistently through that route. |
+| A signed download URL starts returning 403, or the service returns 429. | Access/rate-limit failure, reported separately from a broken range implementation. |
+
+The strongest fit is **developers, self-hosters, and release/CDN maintainers investigating a download problem**. Regular file downloads do not need an extra check every time. This does not repair a partial file, speed up transfers, or verify a complete model's checksum.
 
 ## Try it
 
 Requires Python 3.10+ and Git for this installation method:
 
 ```sh
-python -m pip install "git+https://github.com/zare5/rangeglass.git@v0.1.0"
+python -m pip install "git+https://github.com/zare5/rangeglass.git@v0.2.0"
 rangeglass "https://example.com/large-file.bin"
 ```
 
 Replace the example URL with a **direct file link**, not a file-sharing page.
 
-**Without Git:** download the wheel from [Releases](https://github.com/zare5/rangeglass/releases/latest), then run `python -m pip install rangeglass-0.1.0-py3-none-any.whl`.
+**Without Git:** download the wheel from [Releases](https://github.com/zare5/rangeglass/releases/latest), then run `python -m pip install rangeglass-0.2.0-py3-none-any.whl`.
 
 **Without installing a package:** download `rangeglass.pyz` from the same release and run `python rangeglass.pyz "URL"`.
 
@@ -85,12 +97,12 @@ This is an excerpt of actual demo output. `--demo ignores-range` shows a server 
 | Prefix | Does a real `Range` GET return a valid `206` with the right number of bytes? |
 | Overlap | Do two responses agree about bytes they have in common? |
 | Middle | Does a nonzero offset return the requested part, with the same total size and ETag? |
-| Suffix | Does `bytes=-1024` return the end of the file? |
+| Suffix | Does `bytes=-1024` return the end? If the endpoint returns 501, try one explicit tail range and report the limitation. |
 | Matching `If-Range` | Does a strong ETag allow a repeat partial response with consistent bytes? |
-| Mismatching `If-Range` | Does a different validator correctly cause a full `200` response? |
+| Mismatching `If-Range` | Does a different validator cause a consistent full `200` response, with the right sampled length, encoding, ETag, and bytes? |
 | Past the end | Does an out-of-bounds range return `416` and the expected total size? |
 
-Every probe requests `Accept-Encoding: identity`. Reads stop after `sample_bytes + 1` bytes, and redirect bodies are not read. A complete scan uses up to seven probes; redirects can add requests, with a limit of five hops per probe. Earlier failures or an unknown size can stop the scan early.
+Every probe requests `Accept-Encoding: identity`. Reads stop after `sample_bytes + 1` bytes, and redirect bodies are not read. A scan uses seven core probes, plus at most one explicit-tail fallback when suffix syntax returns 501. Redirects can add requests, with a limit of five hops per probe. Network failures, other HTTP access/rate-limit/server errors, or an unknown size can stop the scan early.
 
 The byte cap describes bytes read by the application, **not** TCP/TLS overhead, socket buffering, or traffic between a CDN and its origin. A tiny request can still trigger a large origin fetch on some CDNs.
 
@@ -104,6 +116,8 @@ The byte cap describes bytes read by the application, **not** TCP/TLS overhead, 
 | `UNSUPPORTED` | The initial range request was ignored. This is allowed by HTTP; it prevents this resume method. | `1` |
 | `INCONCLUSIVE` | Network/authentication trouble, an empty file, or insufficient size information prevented completion. | `2` |
 
+An already observed protocol/content failure remains `FAIL` if a later request also encounters a network or HTTP error. The report retains both findings. HTTP permits a valid subset of the requested range; those replies produce a warning so a downloader knows it must request the remaining bytes.
+
 Always verify the downloaded file against a trusted checksum. A passing sample cannot prove every byte is correct or that a signed URL will still work tomorrow.
 
 ## Useful commands
@@ -111,6 +125,9 @@ Always verify the downloaded file against a trusted checksum. A passing sample c
 ```sh
 # Produce a report for an issue or a CI check.
 rangeglass "https://example.com/file.zip" --json > report.json
+
+# Paste the resulting Markdown into a bug report.
+rangeglass "https://example.com/file.zip" --markdown > rangeglass-report.md
 
 # Treat warnings as a failing check.
 rangeglass "https://example.com/file.zip" --strict
@@ -133,6 +150,16 @@ rangeglass "https://example.com/private.bin" --header-env Authorization=DOWNLOAD
 
 Reports remove URL query strings and fragments and omit custom request-header values. **Hostnames and URL paths remain visible**; review reports before sharing. All custom headers are stripped when a redirect crosses an origin (scheme, host, or port). HTTPS-to-HTTP redirects are rejected. Standard Python/system proxy and TLS settings apply; TLS certificate verification stays enabled.
 
+## FAQ
+
+**How do I test whether a URL supports HTTP Range requests?** Run `rangeglass "DIRECT_FILE_URL"`. It sends actual GET requests for the beginning, middle, and end, then compares response metadata and sampled overlaps. `Accept-Ranges: bytes` alone is not enough.
+
+**Can it explain curl error 33 or a failed `curl -C -` resume?** It can test the endpoint's range behavior and identify ignored requests, wrong offsets, and HTTP access errors. [curl defines error 33 as a range request the server does not support or accept](https://curl.se/libcurl/c/libcurl-errors.html). A PASS does not verify your existing partial file or every curl option.
+
+**Does it work with Nginx, Cloudflare, S3-compatible storage, or model downloads?** It tests ordinary HTTP(S) file URLs, so these are relevant debugging scenarios. Results apply to the URL, route, credentials, and moment tested; they are not provider certifications. Paste a direct file URL and supply authentication if required.
+
+**Can it repair corrupt downloads or predict whether a link will expire?** No. It reports sampled server behavior now. Use your downloader to fetch the file and a trusted checksum to verify it afterward. Browser CORS and HTTP/2/3 behavior are outside the current checks.
+
 ## Why this exists
 
 `Accept-Ranges: bytes` is advice, not a guarantee. [RFC 9110 explicitly says clients cannot assume future range requests will succeed](https://www.rfc-editor.org/rfc/rfc9110.html#section-14.3).
@@ -153,7 +180,7 @@ Rangeglass packages a small set of diagnostic requests into a repeatable report.
 
 - HTTP/1.1, single byte ranges, and strong ETag-based `If-Range`. It does not test HTTP/2, HTTP/3, multi-range bodies, date validators, browser CORS, or download speed.
 - A missing strong ETag is a warning, not proof that resume is impossible. Immutable URLs and correctly implemented date validators can also work.
-- Unknown total size and empty resources are inconclusive. A shorter range beginning at the requested offset is accepted with a warning; other subsets are conservatively rejected.
+- Unknown total size and empty resources are inconclusive. Valid contained subsets of a requested range are accepted with a warning.
 - Only sampled overlaps are compared. Incorrect bytes in unsampled portions can go undetected. A changing resource may fail even if each response is individually valid.
 - HTTP permits a server to ignore a range. A failure here describes suitability for the requested chunk/resume workflow, not necessarily a server vulnerability.
 - Timeouts limit socket operations and the body-read loop; they are not a whole-command deadline. DNS and slow response headers can take longer.
@@ -170,6 +197,6 @@ python -m unittest discover -s tests -t . -v
 
 Tests run against local HTTP fixtures: correct ranges, ignored and incorrect offsets, truncated and oversized bodies, chunked responses, changing resources, conditional requests, redirects, authentication boundaries, and CLI exit codes. CI runs on Linux, Windows, and macOS with Python 3.10 and 3.14.
 
-Contributions: [CONTRIBUTING.md](CONTRIBUTING.md). Release history: [CHANGELOG.md](CHANGELOG.md).
+Contributions: [CONTRIBUTING.md](CONTRIBUTING.md). Release history: [CHANGELOG.md](CHANGELOG.md). [Review findings and focused upgrade priorities](docs/review-2026-11-07.md).
 
 MIT licensed. Created by [zare5](https://github.com/zare5).

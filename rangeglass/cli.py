@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import unicodedata
 
@@ -50,6 +51,15 @@ def format_text(report):
     return "\n".join(lines) + "\n"
 
 
+def format_markdown(report):
+    text = format_text(report)
+    # Keep untrusted headers and URL paths inside one literal code block,
+    # even if a response includes backticks or HTML.
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"### Rangeglass diagnostic\n\n{fence}text\n{text}{fence}\n"
+
+
 def parser():
     p = argparse.ArgumentParser(
         description="Check HTTP byte ranges and conditional resume before a large download.",
@@ -57,7 +67,11 @@ def parser():
     )
     p.add_argument("url", nargs="?", help="direct HTTP(S) file URL; quote URLs containing &")
     p.add_argument("--version", action="version", version=f"rangeglass {__version__}")
-    p.add_argument("--json", action="store_true", help="emit a machine-readable report")
+    output = p.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true", help="emit a machine-readable report")
+    output.add_argument(
+        "--markdown", action="store_true", help="emit a report to paste into an issue"
+    )
     p.add_argument("--strict", action="store_true", help="also exit 1 for warnings")
     p.add_argument(
         "--sample-bytes",
@@ -138,11 +152,12 @@ def main(argv=None):
         print("rangeglass: interrupted", file=sys.stderr)
         return 130
     try:
-        output = (
-            json.dumps(report.to_dict(args.strict), indent=2, ensure_ascii=True) + "\n"
-            if args.json
-            else format_text(report)
-        )
+        if args.json:
+            output = json.dumps(report.to_dict(args.strict), indent=2, ensure_ascii=True) + "\n"
+        elif args.markdown:
+            output = format_markdown(report)
+        else:
+            output = format_text(report)
         sys.stdout.write(output)
         sys.stdout.flush()
     except (OSError, UnicodeError):

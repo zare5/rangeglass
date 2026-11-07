@@ -33,6 +33,6 @@
     <text x="658" y="240" fill="#8196b1">Received</text><text x="810" y="240" fill="#f3b38c">bytes 0-1023</text>
     <path d="M658 263h540" stroke="#263448"/>
     <text x="658" y="296" font-size="15" fill="#9fefd0">Check CDN cache keys and Range forwarding.</text>
-    <text x="658" y="339" font-size="13" fill="#8196b1">7 probes / bounded reads / zero dependencies</text>
+    <text x="658" y="339" font-size="13" fill="#8196b1">tiny reads / clear checks / zero dependencies</text>
   </g>
 </svg>

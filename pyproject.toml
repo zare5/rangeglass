@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rangeglass"
-version = "0.1.0"
-description = "See whether a download URL really supports HTTP ranges and conditional resume."
+version = "0.2.0"
+description = "HTTP Range and download resume checker for CDN and proxy diagnostics."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{name = "zare5"}]
-keywords = ["http", "range", "download", "resume", "cdn", "diagnostics"]
+keywords = ["http", "http-range", "download-resume", "cdn", "proxy", "diagnostics", "etag", "if-range", "content-range", "cli"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Environment :: Console",

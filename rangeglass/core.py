@@ -21,6 +21,7 @@ class Finding:
     probe: str
     message: str
     hint: str
+    category: str = "protocol"
 
 
 @dataclass
@@ -36,8 +37,22 @@ class Report:
     probes: list[dict] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
 
-    def add(self, level, code, probe, message, hint):
-        self.findings.append(Finding(level, code, probe, message, hint))
+    def add(self, level, code, probe, message, hint, *, category="protocol"):
+        self.findings.append(Finding(level, code, probe, message, hint, category))
+
+    def finish(self, *, incomplete=False, unsupported=False):
+        errors = [finding for finding in self.findings if finding.level == "error"]
+        if any(finding.category == "protocol" for finding in errors):
+            self.verdict = "fail"
+        elif incomplete or any(finding.category == "operational" for finding in errors):
+            self.verdict = "inconclusive"
+        elif unsupported:
+            self.verdict = "unsupported"
+        elif self.findings:
+            self.verdict = "warn"
+        else:
+            self.verdict = "pass"
+        return self
 
     def exit_code(self, strict=False):
         if self.verdict == "inconclusive":
@@ -76,9 +91,9 @@ def etag_kind(value: str | None) -> str:
 
 def diagnose(url: str, *, sample_bytes=1024, timeout=10, headers=None, use_proxy=True) -> Report:
     url = validate_url(url)
-    if not 2 <= sample_bytes <= 65536:
+    if type(sample_bytes) is not int or not 2 <= sample_bytes <= 65536:
         raise ValueError("sample_bytes must be between 2 and 65536.")
-    if not 0 < timeout <= 120:
+    if type(timeout) not in (int, float) or not 0 < timeout <= 120:
         raise ValueError("timeout must be greater than 0 and at most 120 seconds.")
     transport = Transport(timeout=timeout, headers=headers, use_proxy=use_proxy)
     report = Report(redact_url(url), sample_bytes)
@@ -113,6 +128,33 @@ def diagnose(url: str, *, sample_bytes=1024, timeout=10, headers=None, use_proxy
                 name,
                 "Could not complete this probe.",
                 "Check the URL, TLS certificate, proxy and timeout; retry the diagnostic.",
+                category="protocol" if response.error == "incomplete_body" else "operational",
+            )
+        elif (
+            response.status is not None
+            and response.status >= 400
+            and not (
+                response.status == 416
+                and name in {"prefix", "past_end"}
+                or response.status == 501
+                and name == "suffix"
+            )
+        ):
+            if response.status in {401, 403, 407}:
+                hint = "Check authentication and signed-URL expiry; use the direct file URL."
+            elif response.status == 429:
+                hint = "Wait for the server's rate limit to reset before retrying."
+            elif response.status in {404, 410}:
+                hint = "Check that the file still exists and that this is the correct direct URL."
+            else:
+                hint = "Resolve the HTTP error at the server or proxy, then rerun the diagnostic."
+            report.add(
+                "error",
+                "http_error",
+                name,
+                f"HTTP {response.status} prevented this probe from completing.",
+                hint,
+                category="operational",
             )
         if response.duplicate_headers:
             report.add(
@@ -132,6 +174,75 @@ def diagnose(url: str, *, sample_bytes=1024, timeout=10, headers=None, use_proxy
             )
         return response
 
+    def interrupted(name, response):
+        return response.error is not None or any(
+            finding.probe == name and finding.category == "operational" and finding.level == "error"
+            for finding in report.findings
+        )
+
+    def check_etag(name, response):
+        if initial_etag is not None and response.headers.get("etag") != initial_etag:
+            report.add(
+                "error",
+                "etag_changed",
+                name,
+                "ETag changed or disappeared between probes.",
+                "Check inconsistent cache nodes or a file being replaced during download.",
+            )
+
+    def compare_bytes(name, start, body):
+        for old_start, old_body in samples:
+            lo = max(start, old_start)
+            hi = min(start + len(body), old_start + len(old_body))
+            if (
+                lo < hi
+                and body[lo - start : hi - start] != old_body[lo - old_start : hi - old_start]
+            ):
+                report.add(
+                    "error",
+                    "bytes_changed",
+                    name,
+                    "Overlapping byte ranges contain different bytes.",
+                    "Do not combine these responses; check mutable files or stale range caches.",
+                )
+                break
+
+    def check_full_fallback(response):
+        name = "if_range_mismatch"
+        if response.duplicate_headers:
+            return
+        if response.headers.get("content-encoding", "identity").lower() != "identity":
+            report.add(
+                "error",
+                "encoded_response",
+                name,
+                "Full fallback used content encoding despite requesting identity.",
+                "Serve the same identity representation for full and partial responses.",
+            )
+            return
+        declared = response.headers.get("content-length")
+        if declared is not None and (
+            not re.fullmatch(r"[0-9]{1,20}", declared) or int(declared) != report.size_bytes
+        ):
+            report.add(
+                "error",
+                "full_length_changed",
+                name,
+                "Full-response Content-Length differs from the previously observed total.",
+                "Check for a replaced file or incorrect full-response length metadata.",
+            )
+        expected_read = min(report.size_bytes, sample_bytes + 1)
+        if len(response.body) != expected_read:
+            report.add(
+                "error",
+                "wrong_body_length",
+                name,
+                f"Expected a {expected_read}-byte sample; read {len(response.body)} bytes.",
+                "Check empty, truncated or inconsistent full-response bodies.",
+            )
+        check_etag(name, response)
+        compare_bytes(name, 0, response.body)
+
     def check_range(name: str, response: Response, expected_start, expected_end, *, first=False):
         if response.error or response.duplicate_headers:
             return None
@@ -143,6 +254,7 @@ def diagnose(url: str, *, sample_bytes=1024, timeout=10, headers=None, use_proxy
                     name,
                     "Server returned 200 (full response) to a byte-range request.",
                     "Use a full download or fix Range forwarding; do not append this body.",
+                    category="capability" if first else "protocol",
                 )
             else:
                 report.add(
@@ -151,6 +263,7 @@ def diagnose(url: str, *, sample_bytes=1024, timeout=10, headers=None, use_proxy
                     name,
                     f"Expected 206; received HTTP {response.status}.",
                     "Check access, URL expiry, rate limits and server range support.",
+                    category="operational",
                 )
             return None
         if response.headers.get("content-encoding", "identity").lower() != "identity":
@@ -174,7 +287,7 @@ def diagnose(url: str, *, sample_bytes=1024, timeout=10, headers=None, use_proxy
             return None
         start, end, total = span
         expected_end = min(expected_end, total - 1) if first and total is not None else expected_end
-        if start != expected_start or end > expected_end:
+        if start < expected_start or end > expected_end:
             report.add(
                 "error",
                 "wrong_range",
@@ -183,13 +296,13 @@ def diagnose(url: str, *, sample_bytes=1024, timeout=10, headers=None, use_proxy
                 "Check CDN cache keys and proxy forwarding of the Range header.",
             )
             return None
-        if end < expected_end:
+        if start > expected_start or end < expected_end:
             # RFC 9110 allows only a portion of a requested range to be transferred.
             report.add(
                 "warning",
                 "partial_range",
                 name,
-                "Server returned a shorter portion of the requested range.",
+                "Server returned a contained subset of the requested range.",
                 "The downloader must request the remaining bytes separately.",
             )
         length = end - start + 1
@@ -223,37 +336,14 @@ def diagnose(url: str, *, sample_bytes=1024, timeout=10, headers=None, use_proxy
                     "Total resource size changed or disappeared between probes.",
                     "Use a versioned, immutable download URL and rerun the check.",
                 )
-            current_etag = response.headers.get("etag")
-            if initial_etag is not None and current_etag != initial_etag:
-                report.add(
-                    "error",
-                    "etag_changed",
-                    name,
-                    "ETag changed or disappeared between probes.",
-                    "Check inconsistent cache nodes or a file being replaced during download.",
-                )
-        for old_start, old_body in samples:
-            lo = max(start, old_start)
-            hi = min(end + 1, old_start + len(old_body))
-            if (
-                lo < hi
-                and response.body[lo - start : hi - start]
-                != old_body[lo - old_start : hi - old_start]
-            ):
-                report.add(
-                    "error",
-                    "bytes_changed",
-                    name,
-                    "Overlapping byte ranges contain different bytes.",
-                    "Do not combine these responses; check mutable files or stale range caches.",
-                )
-                break
+            check_etag(name, response)
+        compare_bytes(name, start, response.body)
         samples.append((start, response.body))
         return span
 
     prefix = request("prefix", f"bytes=0-{sample_bytes - 1}")
-    if prefix.error:
-        return report
+    if interrupted("prefix", prefix):
+        return report.finish(incomplete=True)
     empty = UNSATISFIED.fullmatch(prefix.headers.get("content-range", ""))
     if prefix.status == 416 and empty and len(empty[1]) <= 20 and int(empty[1]) == 0:
         report.add(
@@ -263,15 +353,12 @@ def diagnose(url: str, *, sample_bytes=1024, timeout=10, headers=None, use_proxy
             "The resource is empty.",
             "There are no bytes available to test range behavior.",
         )
-        return report
+        return report.finish(incomplete=True)
     span = check_range("prefix", prefix, 0, sample_bytes - 1, first=True)
     if span is None:
-        report.verdict = (
-            "unsupported"
-            if prefix.status == 200
-            else ("fail" if prefix.status == 206 else "inconclusive")
+        return report.finish(
+            unsupported=prefix.status == 200, incomplete=prefix.status not in {200, 206}
         )
-        return report
     report.size_bytes = span[2]
     initial_etag = prefix.headers.get("etag")
     report.validator = etag_kind(initial_etag)
@@ -283,7 +370,7 @@ def diagnose(url: str, *, sample_bytes=1024, timeout=10, headers=None, use_proxy
             "Server returned a valid range without a total size.",
             "Tail, middle and end-of-file checks need a known total; these checks were skipped.",
         )
-        return report
+        return report.finish(incomplete=True)
     size = report.size_bytes
     if report.validator != "strong":
         report.add(
@@ -300,16 +387,39 @@ def diagnose(url: str, *, sample_bytes=1024, timeout=10, headers=None, use_proxy
     for name, start in specs:
         end = min(start + sample_bytes - 1, size - 1)
         response = request(name, f"bytes={start}-{end}")
+        if interrupted(name, response):
+            return report.finish(incomplete=True)
         check_range(name, response, start, end)
     tail = request("suffix", f"bytes=-{sample_bytes}")
-    check_range("suffix", tail, max(0, size - sample_bytes), size - 1)
+    if interrupted("suffix", tail):
+        return report.finish(incomplete=True)
+    tail_start = max(0, size - sample_bytes)
+    if tail.status == 501:
+        report.add(
+            "warning",
+            "suffix_unsupported",
+            "suffix",
+            "Suffix syntax returned HTTP 501; testing the explicit tail offsets instead.",
+            "Use explicit START-END byte ranges on this endpoint.",
+            category="capability",
+        )
+        tail = request("explicit_tail", f"bytes={tail_start}-{size - 1}")
+        if interrupted("explicit_tail", tail):
+            return report.finish(incomplete=True)
+        check_range("explicit_tail", tail, tail_start, size - 1)
+    else:
+        check_range("suffix", tail, tail_start, size - 1)
     match = initial_etag if report.validator == "strong" else None
     repeat = request("if_range_match" if match else "repeat", f"bytes=0-{sample_bytes - 1}", match)
+    if interrupted("if_range_match" if match else "repeat", repeat):
+        return report.finish(incomplete=True)
     check_range("if_range_match" if match else "repeat", repeat, 0, min(sample_bytes, size) - 1)
 
     # A deliberately different, syntactically valid strong ETag must fall back to 200.
     mismatch = '"rangeglass-' + uuid.uuid4().hex + '"'
     different = request("if_range_mismatch", f"bytes=0-{sample_bytes - 1}", mismatch)
+    if interrupted("if_range_mismatch", different):
+        return report.finish(incomplete=True)
     if not different.error:
         if different.status == 206:
             report.add(
@@ -321,27 +431,45 @@ def diagnose(url: str, *, sample_bytes=1024, timeout=10, headers=None, use_proxy
             )
         elif different.status != 200:
             report.add(
-                "warning",
+                "error",
                 "if_range_unverified",
                 "if_range_mismatch",
                 f"Expected 200 for a mismatching validator; received HTTP {different.status}.",
                 "Conditional resume could not be confirmed; inspect origin/proxy policy.",
+                category="operational",
             )
-        elif different.headers.get("content-encoding", "identity").lower() == "identity":
-            common = min(len(prefix.body), len(different.body), span[1] + 1)
-            if prefix.body[:common] != different.body[:common]:
-                report.add(
-                    "error",
-                    "bytes_changed",
-                    "if_range_mismatch",
-                    "The full-response prefix differs from the initial range.",
-                    "Check inconsistent representations or a file that changed during the scan.",
-                )
+            return report.finish(incomplete=True)
+        else:
+            check_full_fallback(different)
 
     outside = request("past_end", f"bytes={size}-")
+    if interrupted("past_end", outside):
+        return report.finish(incomplete=True)
     if not outside.error:
         expected = f"bytes */{size}"
-        if outside.status != 416 or outside.headers.get("content-range", "").lower() != expected:
+        boundary = UNSATISFIED.fullmatch(outside.headers.get("content-range", ""))
+        if outside.status == 206:
+            report.add(
+                "error",
+                "past_end_partial",
+                "past_end",
+                "Server returned partial content for an offset beyond the observed file.",
+                "Check stale range caches, a changed file size, or incorrect range handling.",
+            )
+        elif (
+            outside.status == 416
+            and boundary
+            and len(boundary[1]) <= 20
+            and int(boundary[1]) != size
+        ):
+            report.add(
+                "error",
+                "size_changed",
+                "past_end",
+                "The end-of-file response reports a different total size.",
+                "Use a stable versioned URL; do not combine responses from different versions.",
+            )
+        elif outside.status != 416 or outside.headers.get("content-range", "").lower() != expected:
             report.add(
                 "warning",
                 "end_boundary_unverified",
@@ -349,12 +477,4 @@ def diagnose(url: str, *, sample_bytes=1024, timeout=10, headers=None, use_proxy
                 "An out-of-bounds range did not return 416 with the expected total size.",
                 "Inspect end-of-file handling; a 200 fallback must never be appended.",
             )
-    if any(p["error"] for p in report.probes):
-        report.verdict = "inconclusive"
-    elif any(f.level == "error" for f in report.findings):
-        report.verdict = "fail"
-    elif report.findings:
-        report.verdict = "warn"
-    else:
-        report.verdict = "pass"
-    return report
+    return report.finish()

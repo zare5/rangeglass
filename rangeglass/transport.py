@@ -144,6 +144,9 @@ class Transport:
                     result.url = redact_url(current)
                     result.status = response.status
                     if response.status in REDIRECTS:
+                        if len(result.redirects) >= 5:
+                            result.error = "too_many_redirects"
+                            return result
                         locations = response.headers.get_all("location", [])
                         if len(locations) != 1:
                             result.error = "missing_or_duplicate_redirect_location"
