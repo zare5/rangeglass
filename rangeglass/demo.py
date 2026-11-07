@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import re
+import socketserver
 import threading
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DATA = bytes(range(256)) * 32
 ETAG = '"rangeglass-demo-v1"'
+
+
+class LoopbackServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer normally resolves its own hostname. An offline fixture
+        # needs neither reverse DNS nor a working network resolver.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
 
 
 class DemoHandler(BaseHTTPRequestHandler):
@@ -53,7 +63,7 @@ class DemoHandler(BaseHTTPRequestHandler):
 
 @contextmanager
 def demo_server():
-    server = ThreadingHTTPServer(("127.0.0.1", 0), DemoHandler)
+    server = LoopbackServer(("127.0.0.1", 0), DemoHandler)
     thread = threading.Thread(
         target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
     )

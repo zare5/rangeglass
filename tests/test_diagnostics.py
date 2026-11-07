@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from rangeglass.cli import main
 from rangeglass.core import diagnose, parse_content_range
+from rangeglass.demo import demo_server
 from rangeglass.transport import Transport, redact_url, validate_headers, validate_url
 
 from .servers import DATA, fixture
@@ -196,6 +197,12 @@ class DiagnosticTests(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
+    def test_offline_demo_does_not_resolve_hostname(self):
+        with patch("socket.getfqdn", side_effect=AssertionError("No reverse DNS in offline demo")):
+            with demo_server() as base:
+                report = diagnose(base + "/good", use_proxy=False)
+        self.assertEqual(report.verdict, "pass")
+
     def test_demo_exit_codes(self):
         for mode, expected in [("good", 0), ("broken", 1), ("ignores-range", 1)]:
             with self.subTest(mode=mode), contextlib.redirect_stdout(io.StringIO()) as output:
