@@ -1,0 +1,23 @@
+name: Report a diagnostic problem
+description: An unexpected result, error, or report from Rangeglass.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include what you expected and how to reproduce it.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Version and environment
+      placeholder: Rangeglass 0.1.0, Python 3.14, Windows 11
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Redacted report or local reproducer
+      description: Remove private hostnames, paths, links, and credentials. JSON queries are redacted automatically, but paths remain visible.
+      render: text

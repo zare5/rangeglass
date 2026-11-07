@@ -1,0 +1,4 @@
+include README.zh-CN.md CHANGELOG.md CONTRIBUTING.md
+recursive-include docs *.md *.svg
+recursive-include tests *.py
+recursive-include tools *.py
